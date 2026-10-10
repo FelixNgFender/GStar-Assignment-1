@@ -3,14 +3,24 @@ import triton
 import triton.language as tl
 import math
 
+
 @triton.jit
 def _flash_attention_forward_causal_kernel(
     # Pointers to Tensors
-    Q_ptr, K_ptr, V_ptr, O_ptr,
+    Q_ptr,
+    K_ptr,
+    V_ptr,
+    O_ptr,
     # Stride information for tensors
-    q_stride_b, q_stride_h, q_stride_s,
-    k_stride_b, k_stride_h, k_stride_s,
-    v_stride_b, v_stride_h, v_stride_s,
+    q_stride_b,
+    q_stride_h,
+    q_stride_s,
+    k_stride_b,
+    k_stride_h,
+    k_stride_s,
+    v_stride_b,
+    v_stride_h,
+    v_stride_s,
     # Kernel parameters
     softmax_scale,
     SEQ_LEN,
@@ -27,21 +37,25 @@ def _flash_attention_forward_causal_kernel(
     # 1. Identify the block of queries and the batch/head to be processed.
     q_block_idx = tl.program_id(axis=0)
     batch_head_idx = tl.program_id(axis=1)
-    
+
     batch_idx = batch_head_idx // N_HEADS
     head_idx = batch_head_idx % N_HEADS
 
     # 2. Initialize accumulators in SRAM.
-    m_i = tl.full([BLOCK_M], -float('inf'), dtype=tl.float32)
+    m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
     # 3. Load the block of queries (Q_i).
-    q_offsets = (q_block_idx * BLOCK_M + tl.arange(0, BLOCK_M))
-    q_ptrs = Q_ptr + batch_idx * q_stride_b + head_idx * q_stride_h + \
-             (q_offsets[:, None] * q_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+    q_offsets = q_block_idx * BLOCK_M + tl.arange(0, BLOCK_M)
+    q_ptrs = (
+        Q_ptr
+        + batch_idx * q_stride_b
+        + head_idx * q_stride_h
+        + (q_offsets[:, None] * q_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+    )
     q_block = tl.load(q_ptrs, mask=q_offsets[:, None] < SEQ_LEN, other=0.0)
-    
+
     # PyTorch softmax is exp(x), Triton is exp2(x * log2(e)), log2(e) is approx 1.44269504
     qk_scale = softmax_scale * 1.44269504
 
@@ -57,7 +71,6 @@ def _flash_attention_forward_causal_kernel(
         pass
         # --- END OF STUDENT IMPLEMENTATION ---
 
-
     # --- Phase 2: Run on the Diagonal Blocks (With Masking) ---
     # Process the blocks where query and key indices can overlap.
     diag_start = q_block_idx * BLOCK_M
@@ -67,35 +80,50 @@ def _flash_attention_forward_causal_kernel(
         pass
         # --- END OF STUDENT IMPLEMENTATION ---
 
-
     # 4. Normalize and write the final output block.
     l_i_safe = l_i[:, None] + 1e-6
     acc = acc / l_i_safe
-    
-    o_ptrs = O_ptr + batch_idx * q_stride_b + head_idx * q_stride_h + \
-             (q_offsets[:, None] * q_stride_s + tl.arange(0, HEAD_DIM)[None, :])
-             
+
+    o_ptrs = (
+        O_ptr
+        + batch_idx * q_stride_b
+        + head_idx * q_stride_h
+        + (q_offsets[:, None] * q_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+    )
+
     tl.store(o_ptrs, acc.to(O_ptr.dtype.element_ty), mask=q_offsets[:, None] < SEQ_LEN)
+
 
 def flash_attention_forward(q, k, v, is_causal=True):
     """
     Python wrapper for the single-kernel, two-phase causal FlashAttention.
     """
     if not is_causal:
-        raise NotImplementedError("This implementation is for causal attention. Use solution_3 for non-causal.")
+        raise NotImplementedError(
+            "This implementation is for causal attention. Use solution_3 for non-causal."
+        )
 
     batch, n_heads, seq_len, head_dim = q.shape
     o = torch.empty_like(q)
     softmax_scale = 1.0 / math.sqrt(head_dim)
-    
+
     BLOCK_M, BLOCK_N = 128, 64
     grid = (triton.cdiv(seq_len, BLOCK_M), batch * n_heads)
 
     _flash_attention_forward_causal_kernel[grid](
-        q, k, v, o,
-        q.stride(0), q.stride(1), q.stride(2),
-        k.stride(0), k.stride(1), k.stride(2),
-        v.stride(0), v.stride(1), v.stride(2),
+        q,
+        k,
+        v,
+        o,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
         softmax_scale,
         seq_len,
         n_heads,

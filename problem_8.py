@@ -5,17 +5,21 @@ import triton.language as tl
 import math
 from typing import Optional
 
+
 class FlashAttention2Function(torch.autograd.Function):
     """
     Triton implementation of FlashAttention-2, supports causal attention and GQA.
     """
+
     @staticmethod
     def forward(ctx, q, k, v, is_causal=True, softmax_scale: Optional[float] = None):
         batch, n_heads, seq_len, head_dim = q.shape
         n_kv_heads = k.shape[1]
 
         assert is_causal, "This kernel only supports causal attention"
-        assert n_heads % n_kv_heads == 0, "num_attention_heads must be divisible by num_kv_heads"
+        assert n_heads % n_kv_heads == 0, (
+            "num_attention_heads must be divisible by num_kv_heads"
+        )
 
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(head_dim)
@@ -25,7 +29,7 @@ class FlashAttention2Function(torch.autograd.Function):
 
         BLOCK_M, BLOCK_N = 128, 64
         grid = (triton.cdiv(seq_len, BLOCK_M), batch * n_heads)
-        
+
         # TODO: Add your forward kernel here
 
         ctx.save_for_backward(q, k, v, o, M)
@@ -51,7 +55,7 @@ class FlashAttention2Function(torch.autograd.Function):
         #   2. Recompute attention probabilities P = softmax(QK^T)
         #   3. Use delta + dO to accumulate gradients for dq, dk, dv
         #   4. Respect GQA mapping and causal mask
-        
+
         return dq, dk.to(k.dtype), dv.to(v.dtype), None, None
 
 
