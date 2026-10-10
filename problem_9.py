@@ -1,8 +1,9 @@
+import math
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
-import math
-from typing import Optional
 
 
 @triton.jit
