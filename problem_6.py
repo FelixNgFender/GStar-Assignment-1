@@ -46,8 +46,10 @@ def _flash_attention_forward_swa_kernel(
     # This problem combines GQA and SWA. First, implement the GQA logic.
     # 1. Calculate the number of query heads per group.
     # 2. Determine the correct kv_head_idx for the current q_head_idx.
-
-    kv_head_idx = 0  # Placeholder: Replace with your GQA calculation
+    n_q_heads_per_group = N_Q_HEADS // N_KV_HEADS
+    kv_head_idx = (
+        q_head_idx // n_q_heads_per_group
+    )  # Placeholder: Replace with your GQA calculation
     # --- END OF GQA IMPLEMENTATION ---
 
     # 2. Initialize accumulators
@@ -73,20 +75,86 @@ def _flash_attention_forward_swa_kernel(
     # 1. Calculate the starting position of the attention window (window_start).
     # 2. Modify the range of the Phase 1 loop to start from your window_start.
 
-    window_start = 0  # Placeholder: Replace with your SWA calculation
+    q_start = q_block_idx * BLOCK_M
+    earliest_key = max(0, q_start - WINDOW_SIZE + 1)
+    window_start = (earliest_key // BLOCK_N) * BLOCK_N
 
     # --- Phase 1: Off-Diagonal Blocks (within the window) ---
     for start_n in range(window_start, q_block_idx * BLOCK_M, BLOCK_N):
         # STUDENT IMPLEMENTATION REQUIRED (Part 3: SWA Logic)
         # Hint: You might need to apply the per-element sliding window mask to s_ij.
         #    - A score is invalid if `(query_offset - key_offset) >= WINDOW_SIZE`.
-        pass
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = (
+            K_ptr
+            + batch_idx * k_stride_b
+            + kv_head_idx * k_stride_h
+            + (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        )
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+        v_ptrs = (
+            V_ptr
+            + batch_idx * v_stride_b
+            + kv_head_idx * v_stride_h
+            + (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        )
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        s_ij = tl.dot(q_block, k_block) * qk_scale
+
+        # per-element sliding window mask
+        distance = q_offsets[:, None] - k_offsets[None, :]
+        allowed = (
+            (distance >= 0) & (distance < WINDOW_SIZE) & (k_offsets[None, :] < SEQ_LEN)
+        )
+        s_ij = tl.where(allowed, s_ij, -float("inf"))
+
+        m_new = tl.maximum(tl.max(s_ij, axis=-1), m_i)
+        m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
+        alpha = tl.exp2(m_i - m_safe)
+        p_ij = tl.exp2(s_ij - m_safe[:, None])
+
+        acc = alpha[:, None] * acc + tl.dot(p_ij.to(v_block.dtype), v_block)
+        l_i = alpha * l_i + tl.sum(p_ij, axis=-1)
+        m_i = m_new
 
     # --- Phase 2: Diagonal Blocks ---
     diag_start = q_block_idx * BLOCK_M
     for start_n in range(diag_start, (q_block_idx + 1) * BLOCK_M, BLOCK_N):
         # STUDENT IMPLEMENTATION REQUIRED
-        pass
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = (
+            K_ptr
+            + batch_idx * k_stride_b
+            + kv_head_idx * k_stride_h
+            + (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        )
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+        v_ptrs = (
+            V_ptr
+            + batch_idx * v_stride_b
+            + kv_head_idx * v_stride_h
+            + (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        )
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        s_ij = tl.dot(q_block, k_block) * qk_scale
+
+        # per-element sliding window mask
+        distance = q_offsets[:, None] - k_offsets[None, :]
+        allowed = (
+            (distance >= 0) & (distance < WINDOW_SIZE) & (k_offsets[None, :] < SEQ_LEN)
+        )
+        s_ij = tl.where(allowed, s_ij, -float("inf"))
+
+        m_new = tl.maximum(tl.max(s_ij, axis=-1), m_i)
+        m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
+        alpha = tl.exp2(m_i - m_safe)
+        p_ij = tl.exp2(s_ij - m_safe[:, None])
+
+        acc = alpha[:, None] * acc + tl.dot(p_ij.to(v_block.dtype), v_block)
+        l_i = alpha * l_i + tl.sum(p_ij, axis=-1)
+        m_i = m_new
     # --- END OF SWA IMPLEMENTATION ---
 
     # 4. Normalize and write the final output block.
