@@ -72,7 +72,144 @@ def _flash_attention_forward_swa_kernel(
     # 1. Phase 0: Sink blocks that are before the sliding window
     # 2. Phase 1: Off-Diagonal Blocks (within the window)
     # 3. Phase 2: Diagonal Blocks
-    pass
+    # --- Phase 0: Sink blocks strictly before Phase 1 tiles ---
+    q_start = q_block_idx * BLOCK_M
+    earliest_key = max(0, q_start - WINDOW_SIZE + 1)
+    window_start = (earliest_key // BLOCK_N) * BLOCK_N
+    sink_end = tl.minimum(SINK_SIZE, window_start)
+
+    for start_n in range(0, sink_end, BLOCK_N):
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+
+        k_ptrs = (
+            K_ptr
+            + batch_idx * k_stride_b
+            + kv_head_idx * k_stride_h
+            + k_offsets[None, :] * k_stride_s
+            + tl.arange(0, HEAD_DIM)[:, None]
+        )
+        k_block = tl.load(
+            k_ptrs,
+            mask=k_offsets[None, :] < SEQ_LEN,
+            other=0.0,
+        )
+
+        v_ptrs = (
+            V_ptr
+            + batch_idx * v_stride_b
+            + kv_head_idx * v_stride_h
+            + k_offsets[:, None] * v_stride_s
+            + tl.arange(0, HEAD_DIM)[None, :]
+        )
+        v_block = tl.load(
+            v_ptrs,
+            mask=k_offsets[:, None] < SEQ_LEN,
+            other=0.0,
+        )
+
+        s_ij = tl.dot(q_block, k_block) * qk_scale
+
+        allowed = (
+            (k_offsets[None, :] < sink_end)
+            & (k_offsets[None, :] < SEQ_LEN)
+            & (k_offsets[None, :] <= q_offsets[:, None])
+        )
+        s_ij = tl.where(allowed, s_ij, -float("inf"))
+
+        m_new = tl.maximum(m_i, tl.max(s_ij, axis=1))
+        m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
+        alpha = tl.exp2(m_i - m_safe)
+        p_ij = tl.exp2(s_ij - m_safe[:, None])
+
+        acc = alpha[:, None] * acc
+        acc += tl.dot(p_ij.to(v_block.dtype), v_block)
+        l_i = alpha * l_i + tl.sum(p_ij, axis=1)
+        m_i = m_new
+
+    # --- Phase 1: Off-Diagonal Blocks (within the window) ---
+    for start_n in range(window_start, q_block_idx * BLOCK_M, BLOCK_N):
+        # STUDENT IMPLEMENTATION REQUIRED (Part 3: SWA Logic)
+        # Hint: You might need to apply the per-element sliding window mask to s_ij.
+        #    - A score is invalid if `(query_offset - key_offset) >= WINDOW_SIZE`.
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = (
+            K_ptr
+            + batch_idx * k_stride_b
+            + kv_head_idx * k_stride_h
+            + (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        )
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+        v_ptrs = (
+            V_ptr
+            + batch_idx * v_stride_b
+            + kv_head_idx * v_stride_h
+            + (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        )
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        s_ij = tl.dot(q_block, k_block) * qk_scale
+
+        # per-element sliding window mask
+        distance = q_offsets[:, None] - k_offsets[None, :]
+
+        is_sink = k_offsets[None, :] < SINK_SIZE
+        in_window = distance < WINDOW_SIZE
+
+        allowed = (
+            (distance >= 0) & (k_offsets[None, :] < SEQ_LEN) & (is_sink | in_window)
+        )
+        s_ij = tl.where(allowed, s_ij, -float("inf"))
+
+        m_new = tl.maximum(tl.max(s_ij, axis=-1), m_i)
+        m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
+        alpha = tl.exp2(m_i - m_safe)
+        p_ij = tl.exp2(s_ij - m_safe[:, None])
+
+        acc = alpha[:, None] * acc + tl.dot(p_ij.to(v_block.dtype), v_block)
+        l_i = alpha * l_i + tl.sum(p_ij, axis=-1)
+        m_i = m_new
+
+    # --- Phase 2: Diagonal Blocks ---
+    diag_start = q_block_idx * BLOCK_M
+    for start_n in range(diag_start, (q_block_idx + 1) * BLOCK_M, BLOCK_N):
+        # STUDENT IMPLEMENTATION REQUIRED
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = (
+            K_ptr
+            + batch_idx * k_stride_b
+            + kv_head_idx * k_stride_h
+            + (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        )
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+        v_ptrs = (
+            V_ptr
+            + batch_idx * v_stride_b
+            + kv_head_idx * v_stride_h
+            + (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        )
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        s_ij = tl.dot(q_block, k_block) * qk_scale
+
+        # per-element sliding window mask
+        distance = q_offsets[:, None] - k_offsets[None, :]
+
+        is_sink = k_offsets[None, :] < SINK_SIZE
+        in_window = distance < WINDOW_SIZE
+
+        allowed = (
+            (distance >= 0) & (k_offsets[None, :] < SEQ_LEN) & (is_sink | in_window)
+        )
+        s_ij = tl.where(allowed, s_ij, -float("inf"))
+
+        m_new = tl.maximum(tl.max(s_ij, axis=-1), m_i)
+        m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
+        alpha = tl.exp2(m_i - m_safe)
+        p_ij = tl.exp2(s_ij - m_safe[:, None])
+
+        acc = alpha[:, None] * acc + tl.dot(p_ij.to(v_block.dtype), v_block)
+        l_i = alpha * l_i + tl.sum(p_ij, axis=-1)
+        m_i = m_new
     # --- END OF STUDENT IMPLEMENTATION ---
 
     # 4. Normalize and write the final output block.
